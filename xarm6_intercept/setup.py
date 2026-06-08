@@ -24,6 +24,8 @@ setup(
     # tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'brain = xarm6_intercept.brain:main',
+            'arm = xarm6_intercept.arm:main'
         ],
     },
 )
