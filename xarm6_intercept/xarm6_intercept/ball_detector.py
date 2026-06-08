@@ -5,6 +5,7 @@ from cv_bridge import CvBridge
 from geometry_msgs.msg import Pose2D
 from rclpy.node import Node
 from sensor_msgs.msg import Image
+from std_msgs.msg import Bool
 
 
 class BallDetector(Node):
@@ -13,7 +14,9 @@ class BallDetector(Node):
 
         self.declare_parameter('image_topic', '/camera/rgb/image_raw')
         self.declare_parameter('ball_topic', '/Ball_Pose2D')
+        self.declare_parameter('ball_detected_topic', '/ball/detected')
         self.declare_parameter('marker_topic', '/Hand_Pose2D')
+        self.declare_parameter('marker_detected_topic', '/gripper_marker/detected')
         self.declare_parameter('debug_view', True)
         self.declare_parameter('draw_all_detections', True)
 
@@ -50,12 +53,16 @@ class BallDetector(Node):
 
         image_topic = self.get_parameter('image_topic').value
         ball_topic = self.get_parameter('ball_topic').value
+        ball_detected_topic = self.get_parameter('ball_detected_topic').value
         marker_topic = self.get_parameter('marker_topic').value
+        marker_detected_topic = self.get_parameter('marker_detected_topic').value
 
         self.bridge = CvBridge()
 
         self.publisher = self.create_publisher(Pose2D, ball_topic, 10)
+        self.detected_publisher = self.create_publisher(Bool, ball_detected_topic, 10)
         self.marker_publisher = self.create_publisher(Pose2D, marker_topic, 10)
+        self.marker_detected_publisher = self.create_publisher(Bool, marker_detected_topic, 10)
         self.subscription = self.create_subscription(
             Image,
             image_topic,
@@ -65,7 +72,9 @@ class BallDetector(Node):
 
         self.get_logger().info(f'Subscribing to {image_topic}')
         self.get_logger().info(f'Publishing ball 2D pose to {ball_topic}')
+        self.get_logger().info(f'Publishing ball detection status to {ball_detected_topic}')
         self.get_logger().info(f'Publishing hand marker 2D pose to {marker_topic}')
+        self.get_logger().info(f'Publishing marker detection status to {marker_detected_topic}')
 
     def image_callback(self, msg):
         try:
@@ -77,12 +86,14 @@ class BallDetector(Node):
         roi, roi_offset = self.crop_roi(frame)
         mask = self.build_mask(roi)
         detections = self.detect_balls(mask, roi_offset)
+        self.detected_publisher.publish(Bool(data=bool(detections)))
 
         marker_mask = None
         marker_detections = []
         if self.get_parameter('detect_marker').value:
             marker_mask = self.build_marker_mask(roi)
             marker_detections = self.detect_markers(marker_mask, roi_offset)
+        self.marker_detected_publisher.publish(Bool(data=bool(marker_detections)))
 
         debug_view = self.get_parameter('debug_view').value
         debug_frame = frame.copy() if debug_view else None
@@ -106,7 +117,7 @@ class BallDetector(Node):
 
                 cv2.putText(
                     debug_frame,
-                    f'x={x} y={y} r={radius}',
+                    f'Ball x={x} y={y} r={radius}',
                     (max(0, x - radius), max(20, y - radius - 10)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6,
@@ -129,7 +140,7 @@ class BallDetector(Node):
                 cv2.circle(debug_frame, (mx, my), 3, (255, 0, 255), -1)
                 cv2.putText(
                     debug_frame,
-                    f'marker x={mx} y={my} s={marker_size}',
+                    f'Hand x={mx} y={my} s={marker_size}',
                     (max(0, mx - marker_size), max(20, my - marker_size - 10)),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.55,
@@ -140,9 +151,9 @@ class BallDetector(Node):
 
         if debug_view:
             cv2.imshow('ball_detector', debug_frame)
-            cv2.imshow('ball_detector_mask', mask)
+            cv2.imshow('Ball_mask', mask)
             if marker_mask is not None:
-                cv2.imshow('gripper_marker_mask', marker_mask)
+                cv2.imshow('Hand_mask', marker_mask)
             cv2.waitKey(1)
 
     def crop_roi(self, frame):
