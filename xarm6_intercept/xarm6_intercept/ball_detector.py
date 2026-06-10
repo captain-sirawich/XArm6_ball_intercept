@@ -1,24 +1,25 @@
+#!/usr/bin/env python3
+
 import cv2
 import numpy as np
 import rclpy
+
 from cv_bridge import CvBridge
-from geometry_msgs.msg import Pose2D
+from geometry_msgs.msg import PointStamped
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Bool
 
 
-class BallDetector(Node):
+class EyeNode(Node):
     def __init__(self):
-        super().__init__('ball_detector')
+        super().__init__('eye_node')
 
-        self.declare_parameter('image_topic', '/camera/rgb/image_raw')
-        self.declare_parameter('ball_topic', '/Ball_Pose2D')
-        self.declare_parameter('ball_detected_topic', '/ball/detected')
-        self.declare_parameter('marker_topic', '/Hand_Pose2D')
-        self.declare_parameter('marker_detected_topic', '/gripper_marker/detected')
+        self.declare_parameter('rgb_topic', '/camera/rgb/image_raw')
+        self.declare_parameter('depth_topic', '/camera/depth/image')
+        self.declare_parameter('camera_info_topic', '/camera/rgb/camera_info')
+        self.declare_parameter('global_frame', 'eye_global')
         self.declare_parameter('debug_view', True)
-        self.declare_parameter('draw_all_detections', True)
 
         self.declare_parameter('h_min', 35)
         self.declare_parameter('s_min', 20)
@@ -27,334 +28,379 @@ class BallDetector(Node):
         self.declare_parameter('s_max', 255)
         self.declare_parameter('v_max', 255)
 
-        self.declare_parameter('min_radius', 20)
-        self.declare_parameter('max_radius', 140)
-        self.declare_parameter('min_area', 500.0)
-        self.declare_parameter('min_circularity', 0.45)
-        self.declare_parameter('min_fill_ratio', 0.35)
-        self.declare_parameter('blur_kernel', 5)
-        self.declare_parameter('morph_kernel', 9)
-        self.declare_parameter('roi_x', 0)
-        self.declare_parameter('roi_y', 0)
-        self.declare_parameter('roi_width', 0)
-        self.declare_parameter('roi_height', 0)
-
-        self.declare_parameter('detect_marker', True)
         self.declare_parameter('marker_h_min', 160)
         self.declare_parameter('marker_h_max', 179)
         self.declare_parameter('marker_s_min', 35)
         self.declare_parameter('marker_s_max', 255)
         self.declare_parameter('marker_v_min', 40)
         self.declare_parameter('marker_v_max', 255)
-        self.declare_parameter('marker_min_area', 350.0)
-        self.declare_parameter('marker_min_width', 12)
-        self.declare_parameter('marker_min_height', 12)
-        self.declare_parameter('marker_min_fill_ratio', 0.45)
 
-        image_topic = self.get_parameter('image_topic').value
-        ball_topic = self.get_parameter('ball_topic').value
-        ball_detected_topic = self.get_parameter('ball_detected_topic').value
-        marker_topic = self.get_parameter('marker_topic').value
-        marker_detected_topic = self.get_parameter('marker_detected_topic').value
+        self.declare_parameter('min_ball_area', 250.0)
+        self.declare_parameter('min_marker_area', 150.0)
+        self.declare_parameter('blur_kernel', 5)
+        self.declare_parameter('morph_kernel', 9)
 
         self.bridge = CvBridge()
 
-        self.publisher = self.create_publisher(Pose2D, ball_topic, 10)
-        self.detected_publisher = self.create_publisher(Bool, ball_detected_topic, 10)
-        self.marker_publisher = self.create_publisher(Pose2D, marker_topic, 10)
-        self.marker_detected_publisher = self.create_publisher(Bool, marker_detected_topic, 10)
-        self.subscription = self.create_subscription(
+        self.latest_depth = None
+        self.fx = None
+        self.fy = None
+        self.cx = None
+        self.cy = None
+
+        self.initialized = False
+        self.initial_gripper_camera = None
+
+        self.global_frame = self.get_parameter('global_frame').value
+
+        self.ball_pub = self.create_publisher(PointStamped, '/eye/ball_global', 10)
+        self.gripper_pub = self.create_publisher(PointStamped, '/eye/gripper_global', 10)
+        self.camera_pub = self.create_publisher(PointStamped, '/eye/camera_global', 10)
+
+        self.ball_detected_pub = self.create_publisher(Bool, '/eye/ball_detected', 10)
+        self.gripper_detected_pub = self.create_publisher(Bool, '/eye/gripper_detected', 10)
+        self.initialized_pub = self.create_publisher(Bool, '/eye/initialized', 10)
+
+        self.create_subscription(
             Image,
-            image_topic,
-            self.image_callback,
+            self.get_parameter('rgb_topic').value,
+            self.rgb_callback,
             10,
         )
 
-        self.get_logger().info(f'Subscribing to {image_topic}')
-        self.get_logger().info(f'Publishing ball 2D pose to {ball_topic}')
-        self.get_logger().info(f'Publishing ball detection status to {ball_detected_topic}')
-        self.get_logger().info(f'Publishing hand marker 2D pose to {marker_topic}')
-        self.get_logger().info(f'Publishing marker detection status to {marker_detected_topic}')
+        self.create_subscription(
+            Image,
+            self.get_parameter('depth_topic').value,
+            self.depth_callback,
+            10,
+        )
 
-    def image_callback(self, msg):
+        self.create_subscription(
+            CameraInfo,
+            self.get_parameter('camera_info_topic').value,
+            self.camera_info_callback,
+            10,
+        )
+
+        self.get_logger().info('Eye node started.')
+        self.get_logger().info('Initial gripper position becomes global (0, 0, 0).')
+        self.get_logger().info('Global XY axes are rotated 90 degrees anti-clockwise.')
+
+    def camera_info_callback(self, msg: CameraInfo):
+        self.fx = msg.k[0]
+        self.fy = msg.k[4]
+        self.cx = msg.k[2]
+        self.cy = msg.k[5]
+
+    def depth_callback(self, msg: Image):
+        try:
+            self.latest_depth = self.bridge.imgmsg_to_cv2(
+                msg,
+                desired_encoding='passthrough'
+            )
+        except Exception as exc:
+            self.get_logger().error(f'Failed to convert depth image: {exc}')
+
+    def rgb_callback(self, msg: Image):
+        if self.latest_depth is None or self.fx is None:
+            self.get_logger().warn('Waiting for depth image and camera info...')
+            return
+
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as exc:
-            self.get_logger().error(f'Failed to convert ROS image: {exc}')
+            self.get_logger().error(f'Failed to convert RGB image: {exc}')
             return
 
-        roi, roi_offset = self.crop_roi(frame)
-        mask = self.build_mask(roi)
-        detections = self.detect_balls(mask, roi_offset)
-        self.detected_publisher.publish(Bool(data=bool(detections)))
+        ball = self.detect_ball(frame)
+        gripper = self.detect_marker(frame)
 
-        marker_mask = None
-        marker_detections = []
-        if self.get_parameter('detect_marker').value:
-            marker_mask = self.build_marker_mask(roi)
-            marker_detections = self.detect_markers(marker_mask, roi_offset)
-        self.marker_detected_publisher.publish(Bool(data=bool(marker_detections)))
+        self.ball_detected_pub.publish(Bool(data=ball is not None))
+        self.gripper_detected_pub.publish(Bool(data=gripper is not None))
+        self.initialized_pub.publish(Bool(data=self.initialized))
 
-        debug_view = self.get_parameter('debug_view').value
-        debug_frame = frame.copy() if debug_view else None
-        if debug_view:
-            self.draw_roi(debug_frame, roi_offset, roi.shape)
+        debug_frame = frame.copy()
 
-        if detections:
-            best_circle = detections[0]
-            x, y, radius = best_circle
-            pose = Pose2D()
-            pose.x = float(x)
-            pose.y = float(y)
-            pose.theta = float(radius)
-            self.publisher.publish(pose)
+        if gripper is not None:
+            gx, gy, gsize = gripper
+            gripper_camera = self.pixel_to_3d(gx, gy)
 
-            if debug_view:
-                circles_to_draw = detections if self.get_parameter('draw_all_detections').value else [best_circle]
-                for draw_x, draw_y, draw_radius in circles_to_draw:
-                    cv2.circle(debug_frame, (draw_x, draw_y), draw_radius, (0, 255, 0), 2)
-                    cv2.circle(debug_frame, (draw_x, draw_y), 3, (0, 0, 255), -1)
+            if gripper_camera is not None:
+                if not self.initialized:
+                    self.initial_gripper_camera = gripper_camera.copy()
+                    self.initialized = True
 
+                    self.get_logger().info(
+                        'Initialized eye global frame. '
+                        'Initial gripper is now global origin: '
+                        '(0.000, 0.000, 0.000)'
+                    )
+
+                    self.get_logger().info(
+                        f'Initial gripper in camera frame: '
+                        f'x={gripper_camera[0]:.3f}, '
+                        f'y={gripper_camera[1]:.3f}, '
+                        f'z={gripper_camera[2]:.3f}'
+                    )
+
+                gripper_global_raw = gripper_camera - self.initial_gripper_camera
+                gripper_global = self.rotate_xy_90_ccw(gripper_global_raw)
+
+                self.publish_point(self.gripper_pub, gripper_global, msg.header.stamp)
+
+                cv2.circle(debug_frame, (gx, gy), 5, (255, 0, 255), -1)
                 cv2.putText(
                     debug_frame,
-                    f'Ball x={x} y={y} r={radius}',
-                    (max(0, x - radius), max(20, y - radius - 10)),
+                    f'Gripper G=({gripper_global[0]:.2f},'
+                    f'{gripper_global[1]:.2f},'
+                    f'{gripper_global[2]:.2f})m',
+                    (max(0, gx - 100), max(20, gy - 20)),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (0, 255, 0),
-                    2,
-                    cv2.LINE_AA,
-                )
-
-        if marker_detections:
-            marker = marker_detections[0]
-            mx, my, marker_size, marker_box = marker
-            marker_pose = Pose2D()
-            marker_pose.x = float(mx)
-            marker_pose.y = float(my)
-            marker_pose.theta = float(marker_size)
-            self.marker_publisher.publish(marker_pose)
-
-            if debug_view:
-                cv2.drawContours(debug_frame, [marker_box], -1, (255, 0, 255), 2)
-                cv2.circle(debug_frame, (mx, my), 3, (255, 0, 255), -1)
-                cv2.putText(
-                    debug_frame,
-                    f'Hand x={mx} y={my} s={marker_size}',
-                    (max(0, mx - marker_size), max(20, my - marker_size - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
+                    0.5,
                     (255, 0, 255),
                     2,
-                    cv2.LINE_AA,
                 )
 
-        if debug_view:
-            cv2.imshow('ball_detector', debug_frame)
-            cv2.imshow('Ball_mask', mask)
-            if marker_mask is not None:
-                cv2.imshow('Hand_mask', marker_mask)
+        if self.initialized:
+            camera_global_raw = -self.initial_gripper_camera
+            camera_global = self.rotate_xy_90_ccw(camera_global_raw)
+            self.publish_point(self.camera_pub, camera_global, msg.header.stamp)
+
+        if ball is not None and self.initialized:
+            bx, by, radius = ball
+            ball_camera = self.pixel_to_3d(bx, by)
+
+            if ball_camera is not None:
+                ball_global_raw = ball_camera - self.initial_gripper_camera
+                ball_global = self.rotate_xy_90_ccw(ball_global_raw)
+
+                self.publish_point(self.ball_pub, ball_global, msg.header.stamp)
+
+                cv2.circle(debug_frame, (bx, by), radius, (0, 255, 0), 2)
+                cv2.circle(debug_frame, (bx, by), 4, (0, 0, 255), -1)
+                cv2.putText(
+                    debug_frame,
+                    f'Ball G=({ball_global[0]:.2f},'
+                    f'{ball_global[1]:.2f},'
+                    f'{ball_global[2]:.2f})m',
+                    (max(0, bx - 100), max(20, by - radius - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 255, 0),
+                    2,
+                )
+
+        if self.get_parameter('debug_view').value:
+            cv2.imshow('eye_node', debug_frame)
             cv2.waitKey(1)
 
-    def crop_roi(self, frame):
-        height, width = frame.shape[:2]
-        x = int(self.get_parameter('roi_x').value)
-        y = int(self.get_parameter('roi_y').value)
-        roi_width = int(self.get_parameter('roi_width').value)
-        roi_height = int(self.get_parameter('roi_height').value)
+    def rotate_xy_90_ccw(self, point):
+        return np.array([
+            -point[1],
+            point[0],
+            point[2],
+        ], dtype=np.float64)
 
-        if roi_width <= 0:
-            roi_width = width - x
-        if roi_height <= 0:
-            roi_height = height - y
+    def publish_point(self, publisher, xyz, stamp):
+        msg = PointStamped()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.global_frame
+        msg.point.x = float(xyz[0])
+        msg.point.y = float(xyz[1])
+        msg.point.z = float(xyz[2])
+        publisher.publish(msg)
 
-        x = max(0, min(x, width - 1))
-        y = max(0, min(y, height - 1))
-        x2 = max(x + 1, min(x + roi_width, width))
-        y2 = max(y + 1, min(y + roi_height, height))
-        return frame[y:y2, x:x2], (x, y)
+    def pixel_to_3d(self, u, v):
+        h, w = self.latest_depth.shape[:2]
 
-    @staticmethod
-    def draw_roi(frame, offset, roi_shape):
-        x, y = offset
-        roi_height, roi_width = roi_shape[:2]
-        cv2.rectangle(
-            frame,
-            (x, y),
-            (x + roi_width - 1, y + roi_height - 1),
-            (255, 180, 0),
-            1,
-        )
+        if u < 0 or v < 0 or u >= w or v >= h:
+            return None
 
-    def build_mask(self, frame):
-        lower = np.array([
-            self.get_parameter('h_min').value,
-            self.get_parameter('s_min').value,
-            self.get_parameter('v_min').value,
-        ])
-        upper = np.array([
-            self.get_parameter('h_max').value,
-            self.get_parameter('s_max').value,
-            self.get_parameter('v_max').value,
-        ])
-        return self.build_hsv_mask(frame, lower, upper)
+        depth_value = self.latest_depth[v, u]
 
-    def build_marker_mask(self, frame):
-        lower = np.array([
-            self.get_parameter('marker_h_min').value,
-            self.get_parameter('marker_s_min').value,
-            self.get_parameter('marker_v_min').value,
-        ])
-        upper = np.array([
-            self.get_parameter('marker_h_max').value,
-            self.get_parameter('marker_s_max').value,
-            self.get_parameter('marker_v_max').value,
-        ])
-        return self.build_hsv_mask(frame, lower, upper)
+        if isinstance(depth_value, np.ndarray):
+            depth_value = depth_value[0]
+
+        z = float(depth_value)
+
+        if self.latest_depth.dtype == np.uint16:
+            z = z / 1000.0
+
+        if z <= 0.0 or np.isnan(z) or np.isinf(z):
+            z = self.search_valid_depth(u, v)
+
+        if z is None:
+            return None
+
+        x = (u - self.cx) * z / self.fx
+        y = (v - self.cy) * z / self.fy
+
+        return np.array([x, y, z], dtype=np.float64)
+
+    def search_valid_depth(self, u, v, window=5):
+        h, w = self.latest_depth.shape[:2]
+        values = []
+
+        for dy in range(-window, window + 1):
+            for dx in range(-window, window + 1):
+                px = u + dx
+                py = v + dy
+
+                if px < 0 or py < 0 or px >= w or py >= h:
+                    continue
+
+                value = float(self.latest_depth[py, px])
+
+                if self.latest_depth.dtype == np.uint16:
+                    value = value / 1000.0
+
+                if value > 0.0 and not np.isnan(value) and not np.isinf(value):
+                    values.append(value)
+
+        if not values:
+            return None
+
+        return float(np.median(values))
 
     def build_hsv_mask(self, frame, lower, upper):
-        blur_kernel = self.get_parameter('blur_kernel').value
+        blur_kernel = int(self.get_parameter('blur_kernel').value)
+        morph_kernel = int(self.get_parameter('morph_kernel').value)
+
         if blur_kernel % 2 == 0:
             blur_kernel += 1
 
-        morph_kernel = self.get_parameter('morph_kernel').value
         if morph_kernel % 2 == 0:
             morph_kernel += 1
 
         blurred = cv2.GaussianBlur(frame, (blur_kernel, blur_kernel), 0)
         hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, lower, upper)
+
         kernel = np.ones((morph_kernel, morph_kernel), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        return self.fill_mask_holes(mask)
 
-    @staticmethod
-    def fill_mask_holes(mask):
+        return mask
+
+    def detect_ball(self, frame):
+        lower = np.array([
+            self.get_parameter('h_min').value,
+            self.get_parameter('s_min').value,
+            self.get_parameter('v_min').value,
+        ])
+
+        upper = np.array([
+            self.get_parameter('h_max').value,
+            self.get_parameter('s_max').value,
+            self.get_parameter('v_max').value,
+        ])
+
+        mask = self.build_hsv_mask(frame, lower, upper)
+
         contours, _ = cv2.findContours(
             mask,
             cv2.RETR_EXTERNAL,
             cv2.CHAIN_APPROX_SIMPLE,
         )
-        filled = np.zeros_like(mask)
-        cv2.drawContours(filled, contours, -1, 255, thickness=cv2.FILLED)
-        return filled
 
-    def detect_balls(self, mask, roi_offset):
-        contours, _ = cv2.findContours(
-            mask,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE,
-        )
+        min_area = float(self.get_parameter('min_ball_area').value)
+        candidates = []
 
-        min_area = float(self.get_parameter('min_area').value)
-        min_radius = int(self.get_parameter('min_radius').value)
-        max_radius = int(self.get_parameter('max_radius').value)
-        min_circularity = float(self.get_parameter('min_circularity').value)
-        min_fill_ratio = float(self.get_parameter('min_fill_ratio').value)
-
-        valid_candidates = []
-        offset_x, offset_y = roi_offset
         for contour in contours:
             area = cv2.contourArea(contour)
+
             if area < min_area:
                 continue
 
             (x, y), radius = cv2.minEnclosingCircle(contour)
-            if radius < min_radius or radius > max_radius:
-                continue
 
-            circle_area = np.pi * radius * radius
-            fill_ratio = area / circle_area if circle_area > 0.0 else 0.0
-            if fill_ratio < min_fill_ratio:
+            if radius < 10:
                 continue
 
             perimeter = cv2.arcLength(contour, True)
-            circularity = (4.0 * np.pi * area / (perimeter * perimeter)) if perimeter > 0.0 else 0.0
-            if circularity < min_circularity:
+            circularity = 0.0
+
+            if perimeter > 0:
+                circularity = 4.0 * np.pi * area / (perimeter * perimeter)
+
+            if circularity < 0.4:
                 continue
 
-            score = area * (0.7 + circularity) * (0.7 + fill_ratio)
-            valid_candidates.append((score, x, y, radius))
+            score = area * circularity
+            candidates.append((
+                score,
+                int(round(x)),
+                int(round(y)),
+                int(round(radius))
+            ))
 
-        if not valid_candidates:
-            return []
+        if not candidates:
+            return None
 
-        valid_candidates.sort(key=lambda candidate: candidate[0], reverse=True)
-        valid_candidates = self.remove_duplicate_candidates(valid_candidates)
-        return [
-            (int(round(x + offset_x)), int(round(y + offset_y)), int(round(radius)))
-            for _, x, y, radius in valid_candidates
-        ]
+        candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+        _, x, y, radius = candidates[0]
 
-    def detect_markers(self, mask, roi_offset):
+        return x, y, radius
+
+    def detect_marker(self, frame):
+        lower = np.array([
+            self.get_parameter('marker_h_min').value,
+            self.get_parameter('marker_s_min').value,
+            self.get_parameter('marker_v_min').value,
+        ])
+
+        upper = np.array([
+            self.get_parameter('marker_h_max').value,
+            self.get_parameter('marker_s_max').value,
+            self.get_parameter('marker_v_max').value,
+        ])
+
+        mask = self.build_hsv_mask(frame, lower, upper)
+
         contours, _ = cv2.findContours(
             mask,
             cv2.RETR_EXTERNAL,
             cv2.CHAIN_APPROX_SIMPLE,
         )
 
-        min_area = float(self.get_parameter('marker_min_area').value)
-        min_width = int(self.get_parameter('marker_min_width').value)
-        min_height = int(self.get_parameter('marker_min_height').value)
-        min_fill_ratio = float(self.get_parameter('marker_min_fill_ratio').value)
-
+        min_area = float(self.get_parameter('min_marker_area').value)
         candidates = []
-        offset_x, offset_y = roi_offset
+
         for contour in contours:
             area = cv2.contourArea(contour)
+
             if area < min_area:
                 continue
 
             rect = cv2.minAreaRect(contour)
             (x, y), (width, height), _ = rect
-            if width < min_width or height < min_height:
+
+            if width < 8 or height < 8:
                 continue
 
-            rect_area = width * height
-            fill_ratio = area / rect_area if rect_area > 0.0 else 0.0
-            if fill_ratio < min_fill_ratio:
-                continue
+            size = int(round(max(width, height)))
+            score = area
 
-            box = cv2.boxPoints(rect)
-            box[:, 0] += offset_x
-            box[:, 1] += offset_y
-            box = np.round(box).astype(np.int32)
-            marker_size = int(round(max(width, height) * 0.5))
-            score = area * fill_ratio
             candidates.append((
                 score,
-                int(round(x + offset_x)),
-                int(round(y + offset_y)),
-                max(1, marker_size),
-                box,
+                int(round(x)),
+                int(round(y)),
+                size
             ))
 
-        candidates.sort(key=lambda candidate: candidate[0], reverse=True)
-        return [
-            (x, y, marker_size, box)
-            for _, x, y, marker_size, box in candidates
-        ]
+        if not candidates:
+            return None
 
-    @staticmethod
-    def remove_duplicate_candidates(candidates):
-        filtered = []
-        for candidate in candidates:
-            _, x, y, radius = candidate
-            duplicate = False
-            for _, kept_x, kept_y, kept_radius in filtered:
-                center_distance = np.hypot(x - kept_x, y - kept_y)
-                if center_distance < min(radius, kept_radius) * 0.55:
-                    duplicate = True
-                    break
-            if not duplicate:
-                filtered.append(candidate)
-        return filtered
+        candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+        _, x, y, size = candidates[0]
+
+        return x, y, size
 
 
 def main(args=None):
     rclpy.init(args=args)
-    node = BallDetector()
+    node = EyeNode()
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
