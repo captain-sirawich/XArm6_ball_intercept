@@ -18,13 +18,13 @@ class XArmXBrain(Node):
             Pose,
             '/target_pose',
             self.goal_callback,
-            10
+            1
         )
 
         self.vel_pub = self.create_publisher(
             Float32,
             '/xarm/x_velocity_cmd',
-            10
+            1
         )
 
         self.tf_buffer = Buffer()
@@ -35,9 +35,9 @@ class XArmXBrain(Node):
 
         self.latest_target_x = None
 
-        self.fixed_speed_m_s = 0.75
-        self.tolerance = 0.01
-        self.dt = 0.1
+        self.fixed_speed_m_s = 1.0
+        self.tolerance = 0.05
+        self.dt = 0.07
 
 
         self.min_x = -0.4
@@ -87,22 +87,22 @@ class XArmXBrain(Node):
         if abs(error) <= self.tolerance:
             vx_m_s = 0.0
         elif error > 0:
-            # if abs(error) < 0.06:
+            # if abs(error) < 0.1:
             #     vx_m_s = self.fixed_speed_m_s/4
-            # elif abs(error) < 0.1:
+            # elif abs(error) < 0.2:
             #     vx_m_s = self.fixed_speed_m_s/2
             # else:
             #     vx_m_s = self.fixed_speed_m_s
-            vx_m_s = self.fixed_speed_m_s*math.sqrt(abs(error))
+            vx_m_s = self.fixed_speed_m_s*error
                 
         else:
-            # if abs(error) < 0.06:
+            # if abs(error) < 0.1:
             #     vx_m_s = -self.fixed_speed_m_s/4
-            # elif abs(error) < 0.1:
+            # elif abs(error) < 0.2:
             #     vx_m_s = -self.fixed_speed_m_s/2
             # else:
             #     vx_m_s = -self.fixed_speed_m_s
-            vx_m_s = -self.fixed_speed_m_s*math.sqrt(abs(error))
+            vx_m_s = self.fixed_speed_m_s*error
 
         self.publish_velocity(vx_m_s)
 
