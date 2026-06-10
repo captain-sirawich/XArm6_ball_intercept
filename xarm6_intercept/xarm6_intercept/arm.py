@@ -33,14 +33,14 @@ class XArmVelocityDriver(Node):
         self.vel_pub = self.create_publisher(
             MoveVelocity,
             '/xarm/vc_set_cartesian_velocity',
-            10
+            1
         )
 
         self.vel_sub = self.create_subscription(
             Float32,
             '/xarm/x_velocity_cmd',
             self.velocity_callback,
-            10
+            1
         )
 
         self.enable_velocity_mode()
