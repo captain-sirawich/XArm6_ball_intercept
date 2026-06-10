@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
 
+import math
+
 import rclpy
 from rclpy.node import Node
 
-from geometry_msgs.msg import Pose
+from geometry_msgs.msg import PointStamped
 from std_msgs.msg import Float32
 from tf2_ros import Buffer, TransformListener
-
-import math
 
 
 class XArmXBrain(Node):
     def __init__(self):
         super().__init__('xarm_x_brain')
 
-        self.goal_sub = self.create_subscription(
-            Pose,
-            '/target_pose',
-            self.goal_callback,
-            1
+        self.ball_sub = self.create_subscription(
+            PointStamped,
+            '/eye/ball_global',
+            self.ball_callback,
+            10
         )
 
         self.vel_pub = self.create_publisher(
             Float32,
             '/xarm/x_velocity_cmd',
-            1
+            10
         )
 
         self.tf_buffer = Buffer()
@@ -34,30 +34,33 @@ class XArmXBrain(Node):
         self.tcp_frame = 'link6'
 
         self.latest_target_x = None
+        self.last_ball_time = None
 
         self.fixed_speed_m_s = 1.0
-        self.tolerance = 0.05
-        self.dt = 0.07
-
+        self.tolerance = 0.01
+        self.dt = 0.05
+        self.target_timeout = 0.5
 
         self.min_x = -0.4
         self.max_x = 0.4
+        self.max_velocity = 1.0
 
         self.timer = self.create_timer(self.dt, self.control_loop)
 
-        self.get_logger().info('Brain ready. Using latest /target_pose only.')
+        self.get_logger().info('Brain ready. Listening to /eye/ball_global.')
 
-    def goal_callback(self, pose: Pose):
-        target_x = pose.position.x
+    def ball_callback(self, msg: PointStamped):
+        target_x = msg.point.x
 
         if target_x < self.min_x or target_x > self.max_x:
             self.get_logger().warn(
-                f'Ignored target_x={target_x:.4f}. '
+                f'Ignored ball target_x={target_x:.4f}. '
                 f'Allowed range: [{self.min_x:.4f}, {self.max_x:.4f}]'
             )
             return
 
         self.latest_target_x = target_x
+        self.last_ball_time = self.get_clock().now()
 
     def get_current_x(self):
         try:
@@ -71,8 +74,15 @@ class XArmXBrain(Node):
             self.get_logger().warn(f'Cannot get current X: {e}')
             return None
 
+    def ball_target_is_stale(self):
+        if self.last_ball_time is None:
+            return True
+
+        age = self.get_clock().now() - self.last_ball_time
+        return age.nanoseconds / 1e9 > self.target_timeout
+
     def control_loop(self):
-        if self.latest_target_x is None:
+        if self.latest_target_x is None or self.ball_target_is_stale():
             self.publish_velocity(0.0)
             return
 
@@ -86,29 +96,19 @@ class XArmXBrain(Node):
 
         if abs(error) <= self.tolerance:
             vx_m_s = 0.0
-        elif error > 0:
-            # if abs(error) < 0.1:
-            #     vx_m_s = self.fixed_speed_m_s/4
-            # elif abs(error) < 0.2:
-            #     vx_m_s = self.fixed_speed_m_s/2
-            # else:
-            #     vx_m_s = self.fixed_speed_m_s
-            vx_m_s = self.fixed_speed_m_s*error
-                
         else:
-            # if abs(error) < 0.1:
-            #     vx_m_s = -self.fixed_speed_m_s/4
-            # elif abs(error) < 0.2:
-            #     vx_m_s = -self.fixed_speed_m_s/2
-            # else:
-            #     vx_m_s = -self.fixed_speed_m_s
-            vx_m_s = self.fixed_speed_m_s*error
+            direction = 1.0 if error > 0 else -1.0
+            # vx_m_s = direction * self.fixed_speed_m_s * math.sqrt(abs(error))
+            vx_m_s = direction * self.fixed_speed_m_s
+
+
+        vx_m_s = max(-self.max_velocity, min(self.max_velocity, vx_m_s))
 
         self.publish_velocity(vx_m_s)
 
         self.get_logger().info(
             f'current_x={current_x:.4f}, '
-            f'latest_target_x={self.latest_target_x:.4f}, '
+            f'ball_x={self.latest_target_x:.4f}, '
             f'error={error:.4f}, '
             f'cmd_vx={vx_m_s * 1000:.1f} mm/s'
         )
