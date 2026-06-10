@@ -8,12 +8,19 @@ from xarm_msgs.srv import PlanJoint, PlanExec
 
 
 TARGET = [
-    -1.570802092552185,
-    0.5235917568206787,
-    -0.52359938621521,
-    -3.1416022777557373,
-    1.5707982778549194,
-    -0.08727966994047165,
+    # -1.570802092552185,
+    # 0.5235917568206787,
+    # -0.52359938621521,
+    # -3.1416022777557373,
+    # 1.5707982778549194,
+    # -0.08727966994047165,
+    -1.5708001852035522,
+    0.34906306862831116,
+    -0.6108618378639221,
+    -3.1415984630584717,
+    1.134453535079956,
+    -0.08727200329303741
+
 ]
 
 
@@ -41,6 +48,7 @@ class ResetInitialPositionStepwise(Node):
         self.get_logger().info('Waiting for current joint state...')
 
     def joint_state_callback(self, msg):
+        # We only need to catch the joint state once to initialize the sequence
         if self.current_joints is not None:
             return
 
@@ -61,11 +69,18 @@ class ResetInitialPositionStepwise(Node):
 
         self.get_logger().info(f'Current joints: {self.current_joints}')
 
-        first_target = self.current_joints.copy()
-        first_target[0] = TARGET[0]
+        # ---------------------------------------------------------
+        # STEP 1: Set Joint 3 to -1.500 (Retract elbow)
+        # ---------------------------------------------------------
+        self.get_logger().info('Step 1: Setting joint 3 to -1.500 to avoid collision')
+        
+        target_step1 = self.current_joints.copy()
+        target_step1[2] = -1.500  # Index 2 corresponds to Joint 3
+        
+        # Save this position state so Step 2 builds off of it
+        self.current_joints = target_step1.copy()
 
-        self.get_logger().info('Step 1: moving joint1 only')
-        self.plan_joint_target(first_target)
+        self.plan_joint_target(target_step1)
 
     def plan_joint_target(self, joints):
         req = PlanJoint.Request()
@@ -98,12 +113,31 @@ class ResetInitialPositionStepwise(Node):
             rclpy.shutdown()
             return
 
+        # ---------------------------------------------------------
+        # State Machine for Step Execution
+        # ---------------------------------------------------------
         if self.step == 0:
             self.step = 1
-            self.get_logger().info('Step 1 complete. Step 2: moving remaining joints')
+            self.get_logger().info('Step 1 complete. Step 2: Moving only joint 1 to target')
+            
+            # STEP 2: Move Joint 1 to TARGET[0], keeping Joint 3 retracted
+            target_step2 = self.current_joints.copy()
+            target_step2[0] = TARGET[0] # Index 0 corresponds to Joint 1
+            
+            # Save this position state so Step 3 builds off of it natively
+            self.current_joints = target_step2.copy()
+            
+            self.plan_joint_target(target_step2)
+            
+        elif self.step == 1:
+            self.step = 2
+            self.get_logger().info('Step 2 complete. Step 3: Moving remaining joints to target')
+            
+            # STEP 3: Move all joints to the final TARGET pose
             self.plan_joint_target(TARGET)
+            
         else:
-            self.get_logger().info('Reset complete')
+            self.get_logger().info('Reset complete. Arm safely reached initial position.')
             rclpy.shutdown()
 
 
