@@ -26,8 +26,8 @@ setup(
         'console_scripts': [
             'brain = xarm6_intercept.brain:main',
             'arm = xarm6_intercept.arm:main',
+            'eye = xarm6_intercept.ball_detector:main',
             'reset = xarm6_intercept.reset_initial_position:main',
-            'pose_commander = xarm6_intercept.pose_commander:main',
         ],
     },
 )
