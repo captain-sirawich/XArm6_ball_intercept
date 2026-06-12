@@ -18,13 +18,13 @@ class XArmXBrain(Node):
             PointStamped,
             '/eye/ball_global',
             self.ball_callback,
-            10
+            1
         )
 
         self.vel_pub = self.create_publisher(
             Float32,
             '/xarm/x_velocity_cmd',
-            10
+            1
         )
 
         self.tf_buffer = Buffer()
@@ -37,8 +37,8 @@ class XArmXBrain(Node):
         self.last_ball_time = None
 
         self.fixed_speed_m_s = 1.0
-        self.tolerance = 0.01
-        self.dt = 0.05
+        self.tolerance = 0.03
+        self.dt = 0.07
         self.target_timeout = 0.5
 
         self.min_x = -0.4
@@ -97,9 +97,9 @@ class XArmXBrain(Node):
         if abs(error) <= self.tolerance:
             vx_m_s = 0.0
         else:
-            direction = 1.0 if error > 0 else -1.0
+            # direction = 1.0 if error > 0 else -1.0
             # vx_m_s = direction * self.fixed_speed_m_s * math.sqrt(abs(error))
-            vx_m_s = direction * self.fixed_speed_m_s
+            vx_m_s = self.fixed_speed_m_s*error
 
 
         vx_m_s = max(-self.max_velocity, min(self.max_velocity, vx_m_s))
