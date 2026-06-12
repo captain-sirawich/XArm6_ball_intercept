@@ -21,10 +21,12 @@ class EyeNode(Node):
         self.declare_parameter('global_frame', 'eye_global')
         self.declare_parameter('debug_view', True)
 
-        self.declare_parameter('h_min', 35)
-        self.declare_parameter('s_min', 20)
-        self.declare_parameter('v_min', 10)
-        self.declare_parameter('h_max', 90)
+        self.declare_parameter('h_min', 18)
+        self.declare_parameter('h_max', 35)
+
+        self.declare_parameter('s_min', 45)
+        self.declare_parameter('v_min', 40)
+
         self.declare_parameter('s_max', 255)
         self.declare_parameter('v_max', 255)
 
