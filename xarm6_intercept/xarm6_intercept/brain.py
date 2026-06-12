@@ -33,6 +33,14 @@ class XArmXBrain(Node):
             1
         )
 
+        self.state_client = self.create_client(
+            SetInt16,
+            '/xarm/set_state'
+        )
+
+        while not self.state_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warn('Waiting for /xarm/set_state service...')
+
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -44,14 +52,17 @@ class XArmXBrain(Node):
 
         self.x_offset = None
 
-        self.fixed_speed_m_s = 2.0
+        self.fixed_speed_m_s = 10.0
         self.tolerance = 0.03
-        self.dt = 0.03
+        self.dt = 0.05
         self.target_timeout = 1.0
 
         self.min_x = -0.4
         self.max_x = 0.4
         self.max_velocity = self.fixed_speed_m_s
+
+        self.was_moving = False
+        self.snap_stop_enabled = True
 
         self.timer = self.create_timer(self.dt, self.control_loop)
 
@@ -76,7 +87,6 @@ class XArmXBrain(Node):
             return
 
         gripper_global_x = msg.point.x
-
         self.x_offset = current_local_x - gripper_global_x
 
         self.get_logger().info(
@@ -107,18 +117,18 @@ class XArmXBrain(Node):
 
     def control_loop(self):
         if self.x_offset is None:
-            self.publish_velocity(0.0)
+            self.stop_command()
             self.get_logger().warn('Waiting for X calibration...')
             return
 
         if self.latest_ball_global_x is None or self.ball_target_is_stale():
-            self.publish_velocity(0.0)
+            self.stop_command()
             return
 
         current_local_x = self.get_current_x()
 
         if current_local_x is None:
-            self.publish_velocity(0.0)
+            self.stop_command()
             return
 
         target_local_x = self.latest_ball_global_x + self.x_offset
@@ -128,21 +138,32 @@ class XArmXBrain(Node):
                 f'Ignored target_local_x={target_local_x:.4f}. '
                 f'Allowed range: [{self.min_x:.4f}, {self.max_x:.4f}]'
             )
-            self.publish_velocity(0.0)
+            self.stop_command()
             return
 
         error = target_local_x - current_local_x
 
         if abs(error) <= self.tolerance:
-            vx_m_s = 0.0
-            # self.snap_stop_arm()
-        else:
-            direction = 1.0 if error > 0 else -1.0
-            vx_m_s = direction * self.fixed_speed_m_s
+            self.stop_command()
 
-        vx_m_s = max(-self.max_velocity, min(self.max_velocity, vx_m_s))
+            self.get_logger().info(
+                f'Target reached. '
+                f'current_local_x={current_local_x:.4f}, '
+                f'target_local_x={target_local_x:.4f}, '
+                f'error={error:.4f}'
+            )
+            return
+
+        direction = 1.0 if error > 0 else -1.0
+        vx_m_s = direction * self.fixed_speed_m_s
+
+        vx_m_s = max(
+            -self.max_velocity,
+            min(self.max_velocity, vx_m_s)
+        )
 
         self.publish_velocity(vx_m_s)
+        self.was_moving = True
 
         self.get_logger().info(
             f'current_local_x={current_local_x:.4f}, '
@@ -152,25 +173,40 @@ class XArmXBrain(Node):
             f'cmd_vx={vx_m_s * 1000:.1f} mm/s'
         )
 
+    def stop_command(self):
+        self.publish_velocity(0.0)
+
+        if self.was_moving:
+            self.was_moving = False
+
+            if self.snap_stop_enabled:
+                self.snap_stop_arm()
+
     def publish_velocity(self, vx_m_s):
         msg = Float32()
         msg.data = float(vx_m_s)
         self.vel_pub.publish(msg)
 
+    def snap_stop_arm(self):
+        self.get_logger().warn('INITIATING SNAP STOP!')
+
+        if not self.state_client.service_is_ready():
+            self.get_logger().warn('/xarm/set_state service is not ready.')
+            return
+
+        state_req = SetInt16.Request()
+        state_req.data = 4
+
+        self.state_client.call_async(state_req)
+
+        state_req = SetInt16.Request()
+        state_req.data = 0
+
+        self.state_client.call_async(state_req)
+
     def destroy_node(self):
         self.publish_velocity(0.0)
         super().destroy_node()
-
-    # def snap_stop_arm(self):
-    #     """Instantly halts the arm at the hardware level."""
-    #     self.get_logger().warn('INITIATING SNAP STOP!')
-        
-    #     # Create the request object
-    #     state_req = SetInt16.Request()
-    #     state_req.data = 4  # 4 is the xArm code for "Stop"
-        
-    #     # Call the service asynchronously
-    #     self.state_client.call_async(state_req)
 
 
 def main(args=None):
