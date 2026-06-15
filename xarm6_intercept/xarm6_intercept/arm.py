@@ -118,7 +118,7 @@ class XArmVelocityDriver(Node):
         ]
 
         arm_msg.is_tool_coord = False
-        arm_msg.duration = 0.08
+        arm_msg.duration = 0.07
 
         self.vel_pub.publish(arm_msg)
 
