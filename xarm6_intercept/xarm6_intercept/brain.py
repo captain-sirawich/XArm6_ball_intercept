@@ -3,6 +3,7 @@
 import rclpy
 from rclpy.node import Node
 
+from collections import deque
 from geometry_msgs.msg import PointStamped
 from std_msgs.msg import Float32
 from tf2_ros import Buffer, TransformListener
@@ -47,8 +48,13 @@ class XArmXBrain(Node):
         self.base_frame = 'link_base'
         self.tcp_frame = 'link6'
 
-        self.latest_ball_global_x = None
+        # --- PREDICTION VARIABLES ---
+        # deque automatically drops old frames, keeping memory footprint tiny
+        self.ball_history = deque(maxlen=15) 
         self.last_ball_time = None
+        self.intercept_y = 0.0  # The Y-coordinate the arm waits at
+        self.lookback_time = 0.2  # Time window to average out camera jitter
+        # ----------------------------
 
         self.x_offset = None
 
@@ -71,8 +77,13 @@ class XArmXBrain(Node):
         )
 
     def ball_callback(self, msg: PointStamped):
-        self.latest_ball_global_x = msg.point.x
         self.last_ball_time = self.get_clock().now()
+        
+        # Convert ROS hardware timestamp into a standard float
+        cam_time = msg.header.stamp.sec + (msg.header.stamp.nanosec * 1e-9)
+        
+        # Append X, Y, and Time to the rolling buffer
+        self.ball_history.append((msg.point.x, msg.point.y, cam_time))
 
     def gripper_callback(self, msg: PointStamped):
         if self.x_offset is not None:
@@ -115,13 +126,52 @@ class XArmXBrain(Node):
         age = self.get_clock().now() - self.last_ball_time
         return age.nanoseconds / 1e9 > self.target_timeout
 
+    def get_predicted_x(self):
+        """
+        Lightweight geometric intercept calculation using a rolling time buffer.
+        """
+        if len(self.ball_history) < 2:
+            return self.ball_history[0][0] if self.ball_history else None
+
+        current_x, current_y, current_time = self.ball_history[-1]
+
+        # Find the historical point closest to our 0.2s lookback target
+        old_x, old_y, old_time = self.ball_history[0]
+        for x, y, t in reversed(self.ball_history):
+            if current_time - t >= self.lookback_time:
+                old_x, old_y, old_time = x, y, t
+                break
+
+        dt = current_time - old_time
+        
+        # Prevent division by zero if camera sends duplicate timestamps
+        if dt <= 0.01:
+            return current_x
+
+        vx = (current_x - old_x) / dt
+        vy = (current_y - old_y) / dt
+
+        # Fallback: If ball is barely moving in Y, just track its current X
+        if abs(vy) < 0.01:
+            return current_x
+
+        time_to_intercept = (self.intercept_y - current_y) / vy
+
+        # Fallback: If ball is moving away from the arm (<0) or moving incredibly slow (>5s)
+        if time_to_intercept < 0 or time_to_intercept > 5.0:
+            return current_x
+
+        # Calculate spatial intercept
+        predicted_x = current_x + (vx * time_to_intercept)
+        return predicted_x
+
     def control_loop(self):
         if self.x_offset is None:
             self.stop_command()
             self.get_logger().warn('Waiting for X calibration...')
             return
 
-        if self.latest_ball_global_x is None or self.ball_target_is_stale():
+        if not self.ball_history or self.ball_target_is_stale():
             self.stop_command()
             return
 
@@ -131,7 +181,14 @@ class XArmXBrain(Node):
             self.stop_command()
             return
 
-        target_local_x = self.latest_ball_global_x + self.x_offset
+        # Fetch the predicted global coordinate instead of the current one
+        predicted_global_x = self.get_predicted_x()
+        
+        if predicted_global_x is None:
+            self.stop_command()
+            return
+
+        target_local_x = predicted_global_x + self.x_offset
 
         if target_local_x < self.min_x or target_local_x > self.max_x:
             self.get_logger().warn(
@@ -167,7 +224,7 @@ class XArmXBrain(Node):
 
         self.get_logger().info(
             f'current_local_x={current_local_x:.4f}, '
-            f'ball_global_x={self.latest_ball_global_x:.4f}, '
+            f'predicted_global_x={predicted_global_x:.4f}, '
             f'target_local_x={target_local_x:.4f}, '
             f'error={error:.4f}, '
             f'cmd_vx={vx_m_s * 1000:.1f} mm/s'
