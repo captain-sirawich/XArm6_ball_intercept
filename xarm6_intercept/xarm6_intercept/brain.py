@@ -60,7 +60,7 @@ class XArmXBrain(Node):
 
         self.fixed_speed_m_s = 10.0
         self.tolerance = 0.03
-        self.dt = 0.05
+        self.dt = 0.07
         self.target_timeout = 1.0
 
         self.min_x = -0.4
