@@ -4,7 +4,7 @@ import rclpy
 from rclpy.node import Node
 
 from geometry_msgs.msg import PointStamped
-from std_msgs.msg import Float32, Empty
+from std_msgs.msg import Float32
 from tf2_ros import Buffer, TransformListener
 from xarm_msgs.srv import SetInt16
 
@@ -24,14 +24,6 @@ class XArmXBrain(Node):
             PointStamped,
             '/eye/gripper_global',
             self.gripper_callback,
-            1
-        )
-
-        # --- NEW: Reset Command Subscriber ---
-        self.reset_sub = self.create_subscription(
-            Empty,
-            '/xarm/reset_home',
-            self.reset_callback,
             1
         )
 
@@ -57,6 +49,7 @@ class XArmXBrain(Node):
 
         self.latest_ball_global_x = None
         self.last_ball_time = None
+
         self.x_offset = None
 
         self.fixed_speed_m_s = 10.0
@@ -70,10 +63,6 @@ class XArmXBrain(Node):
 
         self.was_moving = False
         self.snap_stop_enabled = True
-        
-        # --- NEW: Reset State Variables ---
-        self.returning_home = False
-        self.home_local_x = 0.0  # Set this to your exact initial local X coordinate
 
         self.timer = self.create_timer(self.dt, self.control_loop)
 
@@ -81,19 +70,9 @@ class XArmXBrain(Node):
             'Brain ready. Calibrating global X to local arm X.'
         )
 
-    # --- NEW: Reset Callback ---
-    def reset_callback(self, msg: Empty):
-        self.get_logger().info('Reset command received! Taking over control to return home.')
-        self.returning_home = True
-
     def ball_callback(self, msg: PointStamped):
         self.latest_ball_global_x = msg.point.x
         self.last_ball_time = self.get_clock().now()
-
-        # If a new ball target comes in, cancel the return home sequence
-        if self.returning_home:
-            self.get_logger().info('New ball detected! Canceling reset.')
-            self.returning_home = False
 
     def gripper_callback(self, msg: PointStamped):
         if self.x_offset is not None:
@@ -142,20 +121,17 @@ class XArmXBrain(Node):
             self.get_logger().warn('Waiting for X calibration...')
             return
 
+        if self.latest_ball_global_x is None or self.ball_target_is_stale():
+            self.stop_command()
+            return
+
         current_local_x = self.get_current_x()
 
         if current_local_x is None:
             self.stop_command()
             return
 
-        # --- NEW: Determine Target based on State ---
-        if self.returning_home:
-            target_local_x = self.home_local_x
-        else:
-            if self.latest_ball_global_x is None or self.ball_target_is_stale():
-                self.stop_command()
-                return
-            target_local_x = self.latest_ball_global_x + self.x_offset
+        target_local_x = self.latest_ball_global_x + self.x_offset
 
         if target_local_x < self.min_x or target_local_x > self.max_x:
             self.get_logger().warn(
@@ -163,9 +139,6 @@ class XArmXBrain(Node):
                 f'Allowed range: [{self.min_x:.4f}, {self.max_x:.4f}]'
             )
             self.stop_command()
-            # If home is somehow out of bounds, cancel the sequence
-            if self.returning_home:
-                self.returning_home = False
             return
 
         error = target_local_x - current_local_x
@@ -173,17 +146,12 @@ class XArmXBrain(Node):
         if abs(error) <= self.tolerance:
             self.stop_command()
 
-            # --- NEW: Check if we just arrived home ---
-            if self.returning_home:
-                self.get_logger().info('Successfully returned to initial position.')
-                self.returning_home = False
-            else:
-                self.get_logger().info(
-                    f'Target reached. '
-                    f'current_local_x={current_local_x:.4f}, '
-                    f'target_local_x={target_local_x:.4f}, '
-                    f'error={error:.4f}'
-                )
+            self.get_logger().info(
+                f'Target reached. '
+                f'current_local_x={current_local_x:.4f}, '
+                f'target_local_x={target_local_x:.4f}, '
+                f'error={error:.4f}'
+            )
             return
 
         direction = 1.0 if error > 0 else -1.0
@@ -197,9 +165,9 @@ class XArmXBrain(Node):
         self.publish_velocity(vx_m_s)
         self.was_moving = True
 
-        state_msg = 'RETURNING HOME' if self.returning_home else 'TRACKING BALL'
         self.get_logger().info(
-            f'[{state_msg}] current_local_x={current_local_x:.4f}, '
+            f'current_local_x={current_local_x:.4f}, '
+            f'ball_global_x={self.latest_ball_global_x:.4f}, '
             f'target_local_x={target_local_x:.4f}, '
             f'error={error:.4f}, '
             f'cmd_vx={vx_m_s * 1000:.1f} mm/s'
