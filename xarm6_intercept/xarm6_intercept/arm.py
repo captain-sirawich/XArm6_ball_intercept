@@ -3,7 +3,7 @@
 import rclpy
 from rclpy.node import Node
 
-from std_msgs.msg import Float32
+from geometry_msgs.msg import Twist
 from xarm_msgs.msg import MoveVelocity
 from xarm_msgs.srv import SetInt16, SetInt16ById
 
@@ -36,9 +36,10 @@ class XArmVelocityDriver(Node):
             1
         )
 
+        # Updated to subscribe to Twist messages for multi-axis support
         self.vel_sub = self.create_subscription(
-            Float32,
-            '/xarm/x_velocity_cmd',
+            Twist,
+            '/xarm/velocity_cmd',
             self.velocity_callback,
             1
         )
@@ -46,7 +47,7 @@ class XArmVelocityDriver(Node):
         self.enable_velocity_mode()
 
         self.get_logger().info(
-            'Velocity driver ready. Listening to /xarm/x_velocity_cmd'
+            'Velocity driver ready. Listening to /xarm/velocity_cmd (Twist)'
         )
 
     def wait_for_service(self, client, name):
@@ -101,16 +102,17 @@ class XArmVelocityDriver(Node):
 
         self.get_logger().info('xArm velocity mode setup finished')
 
-    def velocity_callback(self, msg: Float32):
-        vx_m_s = msg.data
-        vx_mm_s = vx_m_s * 1000.0
+    def velocity_callback(self, msg: Twist):
+        # Extract both X and Y commands
+        vx_mm_s = msg.linear.x * 1000.0
+        vy_mm_s = msg.linear.y * 1000.0
 
         arm_msg = MoveVelocity()
 
         # [vx, vy, vz, rx, ry, rz]
         arm_msg.speeds = [
             float(vx_mm_s),
-            0.0,
+            float(vy_mm_s),
             0.0,
             0.0,
             0.0,
@@ -123,7 +125,7 @@ class XArmVelocityDriver(Node):
         self.vel_pub.publish(arm_msg)
 
         self.get_logger().info(
-            f'Sent xArm velocity: {vx_mm_s:.1f} mm/s'
+            f'Sent velocities -> X: {vx_mm_s:.1f} mm/s | Y: {vy_mm_s:.1f} mm/s'
         )
 
     def stop(self):
